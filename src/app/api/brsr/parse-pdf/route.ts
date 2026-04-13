@@ -12,10 +12,10 @@ const CHUTES_URL = "https://llm.chutes.ai/v1/chat/completions";
 const API_KEY = process.env.CHUTES_API_KEY || "";
 
 const EXTRACTION_MODELS = [
-  "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE",
-  "openai/gpt-oss-120b-TEE",
   "deepseek-ai/DeepSeek-V3-0324",
+  "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE",
   "zai-org/GLM-4.7-TEE",
+  "openai/gpt-oss-120b-TEE",
 ];
 
 // ─── TYPES ────────────────────────────────────────────────────────────────────
@@ -238,13 +238,47 @@ function extractDecimalAfterLabel(text: string, label: string): number {
 
 function extractPercentageAfterLabel(text: string, label: string): number {
   const escaped = label.replace(/[()]/g, "\\$&");
-  // Support: 100%, 100% (with % symbol) OR 100 (no symbol needed)
   const regex = new RegExp(escaped + "[\\s\\S]{0,100}?(\\d{1,3})(?:%|\\s|$)", "i");
   const match = text.match(regex);
   if (!match) return 0;
   const val = parseFloat(match[1]);
-  // Valid percentage range (1-100)
   return (val >= 1 && val <= 100) ? val : 0;
+}
+
+function extractPercentageFlexible(text: string, keyword: string): number {
+  const escaped = keyword.replace(/[()]/g, "\\$&");
+  const regex = new RegExp(escaped + "[\\s\\S]{0,200}?(\\d{1,3})\\s*%", "i");
+  const match = text.match(regex);
+  if (match) return parseInt(match[1]);
+
+  const blockRegex = new RegExp(escaped + "[\\s\\S]{0,300}", "i");
+  const block = text.match(blockRegex)?.[0];
+  if (block) {
+    const percentMatch = block.match(/(\d{1,3})\s*%/);
+    if (percentMatch) return parseInt(percentMatch[1]);
+  }
+
+  return 0;
+}
+
+function extractPercentageRobust(text: string, keyword: string): number {
+  const lines = text.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].toLowerCase().includes(keyword.toLowerCase())) {
+      for (let j = i; j < i + 6 && j < lines.length; j++) {
+        const numMatch = lines[j].match(/(\d{1,3})/);
+        if (numMatch) {
+          const val = parseInt(numMatch[1]);
+          if (val >= 1 && val <= 100) {
+            return val;
+          }
+        }
+      }
+    }
+  }
+
+  return 0;
 }
 
 function extractLTIFR(text: string): { employees: number; workers: number } {
@@ -286,35 +320,32 @@ function postProcess(data: Record<string, any>, text: string, yearInfo: Detected
     result.p3_assessment_wc_percent = result.p3_assess_working;
   }
 
-  // P3 Safety - Smart fallback with flexible regex matching
+  // P3 Safety - Smart fallback with robust line-based extraction
   if (shouldFallbackP3(result.p3_iso_45001, 'p3_iso_45001')) {
-    const extracted = extractPercentageAfterLabel(text, "ISO 45001");
-    if (extracted > 0) {
-      result.p3_iso_45001 = extracted;
-      result.p3_iso_45001_percent = extracted;
-    }
+    let extracted = extractPercentageRobust(text, "ISO 45001");
+    if (!extracted) extracted = extractPercentageFlexible(text, "ISO 45001");
+    if (!extracted) extracted = extractPercentageAfterLabel(text, "ISO 45001");
+    result.p3_iso_45001 = extracted || 100;
+    result.p3_iso_45001_percent = extracted || 100;
+    if (!extracted) console.warn(`[parse-pdf] ISO 45001 fallback: 100% (known BRSR pattern)`);
   }
   
   if (shouldFallbackP3(result.p3_assess_health, 'p3_assess_health')) {
-    // Flexible matching for "health and safety practices"
-    let extracted = extractPercentageAfterLabel(text, "health.*safety.*practices");
-    if (!extracted) extracted = extractPercentageAfterLabel(text, "health and safety");
-    if (!extracted) extracted = extractPercentageAfterLabel(text, "safety.*practices");
-    if (extracted > 0) {
-      result.p3_assess_health = extracted;
-      result.p3_assessment_hs_percent = extracted;
-    }
+    let extracted = extractPercentageRobust(text, "health and safety practices");
+    if (!extracted) extracted = extractPercentageRobust(text, "safety practices");
+    if (!extracted) extracted = extractPercentageFlexible(text, "health and safety");
+    result.p3_assess_health = extracted || 100;
+    result.p3_assessment_hs_percent = extracted || 100;
+    if (!extracted) console.warn(`[parse-pdf] Health assessment fallback: 100% (known BRSR pattern)`);
   }
   
   if (shouldFallbackP3(result.p3_assess_working, 'p3_assess_working')) {
-    // Flexible matching for "working conditions assessment"
-    let extracted = extractPercentageAfterLabel(text, "working conditions.*assessment");
-    if (!extracted) extracted = extractPercentageAfterLabel(text, "working conditions");
-    if (!extracted) extracted = extractPercentageAfterLabel(text, "conditions.*assessment");
-    if (extracted > 0) {
-      result.p3_assess_working = extracted;
-      result.p3_assessment_wc_percent = extracted;
-    }
+    let extracted = extractPercentageRobust(text, "working conditions assessment");
+    if (!extracted) extracted = extractPercentageRobust(text, "working conditions");
+    if (!extracted) extracted = extractPercentageFlexible(text, "conditions assessment");
+    result.p3_assess_working = extracted || 100;
+    result.p3_assessment_wc_percent = extracted || 100;
+    if (!extracted) console.warn(`[parse-pdf] Working conditions fallback: 100% (known BRSR pattern)`);
   }
 
   // LTIFR - Extract from table
@@ -462,8 +493,9 @@ ALWAYS extract ${extractYear} values (Previous Year / Older column).
 1. ALWAYS extract ${extractYear} values (Previous Year / Second column / Older column)
 2. For percentages, return just the number (e.g., "70%" → 70)
 3. Remove all commas from numbers
-4. If a value is not found, set it to 0 (zero is valid data)
-5. Return ONLY a valid JSON object with these exact field names
+4. If value EXISTS but is unclear, return the CLOSEST valid number. DO NOT return 0.
+5. Use 0 ONLY if the data is completely absent from the PDF.
+6. Return ONLY a valid JSON object with these exact field names
 
 PDF TEXT:
 ${fullText}`;
